@@ -164,7 +164,8 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
     model = cp_model.CpModel()
 
     CN = model.NewIntVar(0, CAPACITY_MAX, "CN")  # keputusan (labu)
-    Ages = list(range(0, AGE_EXPIRY))  # 0..26 if expiry=27
+    Ages = list(range(0, AGE_EXPIRY))  # 0..(AGE_EXPIRY-1)
+    last_age = AGE_EXPIRY - 1
 
     B, Use, Short, OutAge, InCN, ExcessCN = {}, {}, {}, {}, {}, {}
 
@@ -201,11 +202,11 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
             # demand balance
             model.Add(sum(Use[(s_idx,a,t)] for a in Ages) + Short[(s_idx,t)] == D[t])
 
-            # expiry (26->27)
+            # expiry (last age -> expiry)
             if t == 0:
-                model.Add(OutAge[(s_idx,t)] >= 0 - Use[(s_idx,26,0)])
+                model.Add(OutAge[(s_idx,t)] >= 0 - Use[(s_idx,last_age,0)])
             else:
-                model.Add(OutAge[(s_idx,t)] >= B[(s_idx,26,t-1)] - Use[(s_idx,26,t)])
+                model.Add(OutAge[(s_idx,t)] >= B[(s_idx,last_age,t-1)] - Use[(s_idx,last_age,t)])
             model.Add(OutAge[(s_idx,t)] >= 0)
 
             # pool CN & pembersihan
