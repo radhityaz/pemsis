@@ -112,11 +112,17 @@ def print_cheats():
 
 # ============== SCENARIO GENERATION ==============
 
-def gen_series(mu, T, sigma):
-    noise = np.random.normal(1.0, sigma, T)
+def gen_series(mu, T, sigma, rng=None):
+    """Generate a stochastic series with optional RNG for reproducibility."""
+    if rng is None:
+        noise = np.random.normal(1.0, sigma, T)
+        samples = np.random.poisson
+    else:
+        noise = rng.normal(1.0, sigma, T)
+        samples = rng.poisson
     noise = np.clip(noise, 0.1, 3.0)
     lam = np.maximum(np.round(mu * noise), 0).astype(int)
-    return np.random.poisson(lam).astype(int)
+    return samples(lam).astype(int)
 
 def motif_apply(arr, motif, params):
     x = arr.copy()
@@ -157,14 +163,37 @@ def motif_apply(arr, motif, params):
 
     return x
 
+
+def generate_scenario(name, T, muD, sigmaD, motifD, paramsD,
+                      muR, sigmaR, motifR, paramsR, rng=None):
+    """Generate demand & supply arrays following configured motifs."""
+    if rng is None:
+        rng = np.random.default_rng()
+    elif not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be an instance of numpy.random.Generator")
+
+    demand_rng = np.random.default_rng(rng.integers(0, 2**32 - 1))
+    supply_rng = np.random.default_rng(rng.integers(0, 2**32 - 1))
+
+    D = gen_series(muD, T, sigmaD, rng=demand_rng)
+    R = gen_series(muR, T, sigmaR, rng=supply_rng)
+
+    D = motif_apply(D, motifD, paramsD or {})
+    R = motif_apply(R, motifR, paramsR or {})
+
+    return {"name": name, "D": D, "R": R}
+
+
 # ============== CP-SAT MODEL (MINIMAX LOSS) ==============
 
 def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
-                    GRACE_DAYS, scenarios, time_limit_s=120, workers=8):
+                    GRACE_DAYS, scenarios, time_limit_s=120, workers=8,
+                    progress=True):
     model = cp_model.CpModel()
 
     CN = model.NewIntVar(0, CAPACITY_MAX, "CN")  # keputusan (labu)
-    Ages = list(range(0, AGE_EXPIRY))  # 0..26 if expiry=27
+    Ages = list(range(0, AGE_EXPIRY))  # 0..(AGE_EXPIRY-1)
+    last_age = AGE_EXPIRY - 1
 
     B, Use, Short, OutAge, InCN, ExcessCN = {}, {}, {}, {}, {}, {}
 
@@ -201,11 +230,11 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
             # demand balance
             model.Add(sum(Use[(s_idx,a,t)] for a in Ages) + Short[(s_idx,t)] == D[t])
 
-            # expiry (26->27)
+            # expiry (last age -> expiry)
             if t == 0:
-                model.Add(OutAge[(s_idx,t)] >= 0 - Use[(s_idx,26,0)])
+                model.Add(OutAge[(s_idx,t)] >= 0 - Use[(s_idx,last_age,0)])
             else:
-                model.Add(OutAge[(s_idx,t)] >= B[(s_idx,26,t-1)] - Use[(s_idx,26,t)])
+                model.Add(OutAge[(s_idx,t)] >= B[(s_idx,last_age,t-1)] - Use[(s_idx,last_age,t)])
             model.Add(OutAge[(s_idx,t)] >= 0)
 
             # pool CN & pembersihan
@@ -234,7 +263,8 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
     solver.parameters.max_time_in_seconds = time_limit_s
     solver.parameters.num_search_workers = workers
 
-    print("\n[Solving] tergantung jumlah skenario & horizon...")
+    if progress:
+        print("\n[Solving] tergantung jumlah skenario & horizon...")
     status = solver.Solve(model)
     ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
@@ -245,7 +275,12 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
     # Ekstraksi hasil (termasuk matriks stok-umur untuk heatmap)
     Ages = list(range(0, AGE_EXPIRY))
     all_Bcube = []  # list per-skenario: ndarray [age, t]
-    for s_idx, sc in enumerate(tqdm(scenarios, desc="Extracting")):
+    if progress:
+        scenario_iter = enumerate(tqdm(scenarios, desc="Extracting"))
+    else:
+        scenario_iter = enumerate(scenarios)
+
+    for s_idx, sc in scenario_iter:
         D, R = sc["D"], sc["R"]
         Short_list, Out_list, Exc_list, InCN_list, Stock_list, Use_tot = [], [], [], [], [], []
         Bcube = np.zeros((AGE_EXPIRY, T), dtype=int)
@@ -297,18 +332,39 @@ def build_and_solve(CAPACITY_MAX, T, AGE_EXPIRY, AGE_CN, B0_TOTAL,
 # ============== PLOTTING ==============
 
 def plot_series(df, title, ycols, outpath):
-    plt.figure()
-    for c in ycols: plt.plot(df["t"], df[c], label=c)
-    plt.xlabel("Day"); plt.ylabel("Units"); plt.title(title); plt.legend(); plt.tight_layout()
-    plt.savefig(outpath); plt.close()
+    fig = make_series_figure(df, title, ycols)
+    fig.savefig(outpath)
+    plt.close(fig)
 
 def plot_heatmap_B(Bcube, outpath):
-    plt.figure()
-    plt.imshow(Bcube, aspect="auto", origin="lower")
-    plt.colorbar(label="Units")
-    plt.yticks(np.arange(Bcube.shape[0]), [f"a{a}" for a in range(Bcube.shape[0])])
-    plt.xlabel("Day"); plt.ylabel("Age"); plt.title("Stock by Age (Heatmap)")
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
+    fig = make_heatmap_figure(Bcube)
+    fig.savefig(outpath)
+    plt.close(fig)
+
+
+def make_series_figure(df, title, ycols):
+    fig, ax = plt.subplots()
+    for c in ycols:
+        ax.plot(df["t"], df[c], label=c)
+    ax.set_xlabel("Day")
+    ax.set_ylabel("Units")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def make_heatmap_figure(Bcube):
+    fig, ax = plt.subplots()
+    im = ax.imshow(Bcube, aspect="auto", origin="lower")
+    fig.colorbar(im, ax=ax, label="Units")
+    ax.set_yticks(np.arange(Bcube.shape[0]))
+    ax.set_yticklabels([f"a{a}" for a in range(Bcube.shape[0])])
+    ax.set_xlabel("Day")
+    ax.set_ylabel("Age")
+    ax.set_title("Stock by Age (Heatmap)")
+    fig.tight_layout()
+    return fig
 
 # ============== MAIN (INTERACTIVE) ==============
 
